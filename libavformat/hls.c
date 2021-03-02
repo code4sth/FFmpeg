@@ -1729,6 +1729,70 @@ static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
     return AVERROR(EPERM);
 }
 
+static int reopen_demux_for_component(AVFormatContext *s, struct playlist *pls)
+{
+    HLSContext *c = s->priv_data;
+    AVInputFormat *in_fmt = NULL;
+    AVDictionary  *in_fmt_opts = NULL;
+    uint8_t *avio_ctx_buffer  = NULL;
+    int ret = 0;
+
+    if (pls->ctx) {
+        /* note: the internal buffer could have changed, and be != avio_ctx_buffer */
+        av_freep(&pls->pb.buffer);
+        memset(&pls->pb, 0x00, sizeof(AVIOContext));
+        pls->ctx->pb = NULL;
+        avformat_close_input(&pls->ctx);
+        pls->ctx = NULL;
+    }
+    if (!(pls->ctx = avformat_alloc_context())) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    avio_ctx_buffer  = av_malloc(INITIAL_BUFFER_SIZE);
+    if (!avio_ctx_buffer ) {
+        ret = AVERROR(ENOMEM);
+        avformat_free_context(pls->ctx);
+        pls->ctx = NULL;
+        goto fail;
+    }
+        ffio_init_context(&pls->pb, avio_ctx_buffer , INITIAL_BUFFER_SIZE, 0, pls, read_data, NULL, NULL);
+        //ffio_init_context(&pls->pb, avio_ctx_buffer , INITIAL_BUFFER_SIZE, 0, pls, read_data, NULL, seek_data);
+    pls->pb.seekable = 0;
+
+    if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0)
+        goto fail;
+
+    pls->ctx->flags = AVFMT_FLAG_CUSTOM_IO;
+    pls->ctx->probesize = 1024 * 4;
+    pls->ctx->max_analyze_duration = 4 * AV_TIME_BASE;
+    ret = av_probe_input_buffer(&pls->pb, &in_fmt, "", NULL, 0, 0);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "Error when loading first fragment, playlist\n");
+        avformat_free_context(pls->ctx);
+        pls->ctx = NULL;
+        goto fail;
+    }
+
+    pls->ctx->pb = &pls->pb;
+    pls->ctx->io_open  = nested_io_open;
+
+    // provide additional information from mpd if available
+    ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
+    av_dict_free(&in_fmt_opts);
+    if (ret < 0)
+        goto fail;
+    if(1) {
+        ret = avformat_find_stream_info(pls->ctx, NULL);
+        if (ret < 0)
+            goto fail;
+    }
+
+fail:
+    return ret;
+}
+
 static void add_stream_to_programs(AVFormatContext *s, struct playlist *pls, AVStream *stream)
 {
     HLSContext *c = s->priv_data;
@@ -2338,6 +2402,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
             pls->seek_flags |= AVSEEK_FLAG_ANY;
         }
     }
+    seek_pls->init_sec_buf_read_offset = 0;
+    reopen_demux_for_component(s, seek_pls);
 
     c->cur_timestamp = seek_timestamp;
 
